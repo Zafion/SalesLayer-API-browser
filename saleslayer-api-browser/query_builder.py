@@ -64,22 +64,29 @@ def build_params(
     if selected_fields:
         params["$select"] = ",".join(selected_fields)
 
-    filter_parts = []
+    built_filters = []
     for item in filters:
         field = item["field"]
         field_type = item.get("field_type", "string")
         operator = item["operator"]
         value = item["value"]
+        joiner = item.get("joiner", "and").lower()
 
         if value is None or str(value).strip() == "":
             continue
 
-        filter_parts.append(
-            _build_filter_expression(field, field_type, operator, str(value).strip())
-        )
+        expression = _build_filter_expression(field, field_type, operator, str(value).strip())
+        built_filters.append({
+            "joiner": joiner,
+            "expression": expression,
+        })
 
-    if filter_parts:
-        params["$filter"] = " and ".join(filter_parts)
+    if built_filters:
+        filter_text = built_filters[0]["expression"]
+        for item in built_filters[1:]:
+            joiner = "or" if item["joiner"] == "or" else "and"
+            filter_text += f" {joiner} {item['expression']}"
+        params["$filter"] = filter_text
 
     if top:
         params["$top"] = str(top)

@@ -107,6 +107,12 @@ class GetTab(QWidget):
 
         filter_controls = QHBoxLayout()
 
+        self.filter_joiner_selector = QComboBox()
+        self.filter_joiner_selector.addItem("AND | y", "and")
+        self.filter_joiner_selector.addItem("OR | o", "or")
+        self.filter_joiner_selector.setMinimumWidth(120)
+        filter_controls.addWidget(self.filter_joiner_selector, 1)
+
         self.filter_field_selector = QComboBox()
         self.filter_field_selector.setMinimumWidth(340)
         self.filter_field_selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -346,6 +352,7 @@ class GetTab(QWidget):
         operator = self.filter_operator_selector.currentData()
         operator_label = self.filter_operator_selector.currentText()
         value = self.filter_value_input.text().strip()
+        joiner = self.filter_joiner_selector.currentData()
 
         if not field_data:
             QMessageBox.warning(self, "Filtro inválido", "Primero carga metadata.")
@@ -365,6 +372,7 @@ class GetTab(QWidget):
             "operator": operator,
             "operator_label": operator_label,
             "value": value,
+            "joiner": joiner,
         }
         self.filters.append(filter_item)
 
@@ -382,8 +390,11 @@ class GetTab(QWidget):
     def refresh_filters_list(self):
         self.filters_list.clear()
 
-        for item in self.filters:
-            text = f'{item["field"]} [{item["field_type"]}] | {item["operator_label"]} | {item["value"]}'
+        for index, item in enumerate(self.filters):
+            prefix = ""
+            if index > 0:
+                prefix = ("OR" if item.get("joiner") == "or" else "AND") + " | "
+            text = f'{prefix}{item["field"]} [{item["field_type"]}] | {item["operator_label"]} | {item["value"]}'
             self.filters_list.addItem(text)
 
     def run_query(self):
