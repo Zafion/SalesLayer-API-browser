@@ -11,7 +11,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
 
 from api_client import SalesLayerApiClient
-from metadata_parser import extract_properties_from_metadata
+from metadata_parser import (
+    extract_properties_from_metadata,
+    extract_custom_entities_tables,
+)
 from query_builder import build_params
 
 
@@ -54,8 +57,13 @@ class SalesLayerBrowser(QWidget):
         self.current_simple_properties = []
         self.filters = []
         self.last_result_data = None
+        self.custom_entities_tables = []
+
+        self.is_loading_metadata = False
+        self.is_populating_custom_entities = False
 
         self.build_ui()
+        self.on_entity_changed()
 
     def build_ui(self):
         main_layout = QVBoxLayout()
@@ -74,8 +82,18 @@ class SalesLayerBrowser(QWidget):
 
         controls_layout.addWidget(QLabel("Entidad:"))
         self.entity_selector = QComboBox()
-        self.entity_selector.addItems(["Products", "Variants", "Categories"])
+        self.entity_selector.addItems(["Products", "Variants", "Categories", "CustomEntities"])
+        self.entity_selector.currentIndexChanged.connect(self.on_entity_changed)
         controls_layout.addWidget(self.entity_selector)
+
+        self.custom_entity_label = QLabel("Custom Entity:")
+        controls_layout.addWidget(self.custom_entity_label)
+
+        self.custom_entity_selector = QComboBox()
+        self.custom_entity_selector.setMinimumWidth(320)
+        self.custom_entity_selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.custom_entity_selector.currentIndexChanged.connect(self.on_custom_entity_changed)
+        controls_layout.addWidget(self.custom_entity_selector)
 
         controls_layout.addWidget(QLabel("Top:"))
         self.top_input = QSpinBox()
@@ -156,11 +174,19 @@ class SalesLayerBrowser(QWidget):
 
         self.setLayout(main_layout)
 
+    def on_entity_changed(self):
+        is_custom_entities = self.entity_selector.currentText() == "CustomEntities"
+        self.custom_entity_label.setVisible(is_custom_entities)
+        self.custom_entity_selector.setVisible(is_custom_entities)
+
     def get_client(self):
         api_key = self.api_key_input.text().strip()
         if not api_key:
             raise ValueError("Debes introducir un API key.")
         return SalesLayerApiClient(api_key)
+
+    def get_selected_custom_entity_denominator(self) -> str | None:
+        return self.custom_entity_selector.currentData()
 
     def get_allowed_operators_for_type(self, field_type: str) -> list[str]:
         normalized_type = (field_type or "").strip().lower()
@@ -191,13 +217,60 @@ class SalesLayerBrowser(QWidget):
         field_type = field_data.get("type", "string")
         self.populate_operator_selector(field_type)
 
-    def load_metadata(self):
+    def load_custom_entities_tables(self, force_refresh: bool = False):
+        previous_selection = self.get_selected_custom_entity_denominator()
+
+        if self.custom_entity_selector.count() > 0 and not force_refresh:
+            return
+
+        metadata_text = self.client.get_metadata("CustomEntities")
+        self.custom_entities_tables = extract_custom_entities_tables(metadata_text)
+
+        if not self.custom_entities_tables:
+            raise ValueError("No se encontraron tablas de Custom Entities en la metadata.")
+
+        self.is_populating_custom_entities = True
         try:
+            self.custom_entity_selector.clear()
+
+            for table in self.custom_entities_tables:
+                self.custom_entity_selector.addItem(
+                    table["denominator"],
+                    table["denominator"]
+                )
+
+            if previous_selection:
+                index = self.custom_entity_selector.findData(previous_selection)
+                if index >= 0:
+                    self.custom_entity_selector.setCurrentIndex(index)
+        finally:
+            self.is_populating_custom_entities = False
+
+    def load_metadata(self):
+        if self.is_loading_metadata:
+            return
+
+        try:
+            self.is_loading_metadata = True
             self.client = self.get_client()
             entity = self.entity_selector.currentText()
 
-            metadata_text = self.client.get_metadata(entity)
-            properties = extract_properties_from_metadata(metadata_text, entity)
+            if entity == "CustomEntities":
+                self.load_custom_entities_tables(force_refresh=False)
+
+                denominator = self.get_selected_custom_entity_denominator()
+                if not denominator:
+                    raise ValueError("No se ha podido determinar la tabla de Custom Entity.")
+
+                metadata_text = self.client.get_metadata("CustomEntities", denominator)
+                properties = extract_properties_from_metadata(
+                    metadata_text,
+                    selected_entity="CustomEntities",
+                    custom_entity_denominator=denominator
+                )
+            else:
+                metadata_text = self.client.get_metadata(entity)
+                properties = extract_properties_from_metadata(metadata_text, entity)
 
             self.current_properties = properties
             self.current_simple_properties = [
@@ -237,15 +310,37 @@ class SalesLayerBrowser(QWidget):
             if self.filter_field_selector.count() > 0:
                 self.on_filter_field_changed()
 
+            extra = ""
+            if entity == "CustomEntities":
+                extra = f" Tabla: {self.get_selected_custom_entity_denominator()}."
+
             QMessageBox.information(
                 self,
                 "Metadata cargada",
                 f"Se han cargado {len(properties)} campos. "
                 f"{len(self.current_simple_properties)} disponibles para filtros simples."
+                f"{extra}"
             )
 
         except Exception as e:
             QMessageBox.critical(self, "Error cargando metadata", str(e))
+        finally:
+            self.is_loading_metadata = False
+
+    def on_custom_entity_changed(self):
+        if self.entity_selector.currentText() != "CustomEntities":
+            return
+
+        if self.is_populating_custom_entities or self.is_loading_metadata:
+            return
+
+        if not self.api_key_input.text().strip():
+            return
+
+        if self.custom_entity_selector.count() == 0:
+            return
+
+        self.load_metadata()
 
     def get_selected_fields(self):
         selected_fields = []
@@ -323,7 +418,13 @@ class SalesLayerBrowser(QWidget):
                 json.dumps(params, indent=2, ensure_ascii=False)
             )
 
-            data = self.client.get_data(entity, params)
+            denominator = None
+            if entity == "CustomEntities":
+                denominator = self.get_selected_custom_entity_denominator()
+                if not denominator:
+                    raise ValueError("Debes seleccionar una tabla de Custom Entity.")
+
+            data = self.client.get_data(entity, params, denominator)
             self.last_result_data = data
 
             self.results_output.setPlainText(
@@ -347,7 +448,18 @@ class SalesLayerBrowser(QWidget):
             QMessageBox.information(self, "Sin contenido", "No hay JSON para exportar.")
             return
 
-        default_name = f"{self.entity_selector.currentText().lower()}_result.json"
+        entity = self.entity_selector.currentText().lower()
+        denominator = self.get_selected_custom_entity_denominator()
+
+        if entity == "customentities" and denominator:
+            safe_denominator = (
+                denominator.replace("/", "_")
+                .replace("\\", "_")
+                .replace(" ", "_")
+            )
+            default_name = f"{entity}_{safe_denominator}_result.json"
+        else:
+            default_name = f"{entity}_result.json"
 
         file_path, _ = QFileDialog.getSaveFileName(
             self,
