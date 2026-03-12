@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
 
 from ui_get_tab import GetTab
 from ui_post_tab import PostTab
+from ui_patch_tab import PatchTab
 
 
 class SalesLayerBrowser(QMainWindow):
@@ -35,9 +36,11 @@ class SalesLayerBrowser(QMainWindow):
 
         self.get_tab = GetTab(self)
         self.post_tab = PostTab(self)
+        self.patch_tab = PatchTab(self)
 
         self.tabs.addTab(self.get_tab, "GET / Read")
         self.tabs.addTab(self.post_tab, "POST / Create")
+        self.tabs.addTab(self.patch_tab, "PATCH / Update")
 
         central_widget.setLayout(main_layout)
 

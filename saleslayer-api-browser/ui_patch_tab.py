@@ -1,0 +1,831 @@
+import json
+from pathlib import Path
+from urllib.parse import quote
+
+import requests
+
+from PySide6.QtWidgets import (
+    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
+    QTextEdit, QSizePolicy, QMessageBox, QFileDialog, QLineEdit,
+    QScrollArea, QFormLayout, QSplitter
+)
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import Qt
+
+from api_client import SalesLayerApiClient
+from metadata_parser import extract_properties_from_metadata
+
+
+SIMPLE_TYPES = {
+    "string",
+    "string | null",
+    "integer",
+    "integer | null",
+    "number",
+    "number | null",
+    "boolean",
+    "boolean | null",
+}
+
+ASSET_CUSTOM_TYPES = {"image_pack", "file"}
+BASE_URL = "https://api2.saleslayer.com/rest/Catalog"
+
+
+class PatchTab(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+
+        self.client = None
+        self.current_properties = []
+        self.current_patchable_properties = []
+        self.custom_entities_tables = []
+        self.last_payload = None
+        self.last_result_data = None
+
+        self.is_loading_metadata = False
+        self.is_populating_custom_entities = False
+        self.form_widgets = {}
+
+        self.build_ui()
+        self.on_entity_changed()
+
+    def build_ui(self):
+        root_layout = QVBoxLayout()
+
+        main_splitter = QSplitter(Qt.Vertical)
+
+        top_widget = QWidget()
+        top_layout = QVBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+
+        controls_layout = QHBoxLayout()
+
+        controls_layout.addWidget(QLabel("Entidad:"))
+        self.entity_selector = QComboBox()
+        self.entity_selector.addItems(["Products", "Variants", "Categories", "CustomEntities"])
+        self.entity_selector.currentIndexChanged.connect(self.on_entity_changed)
+        controls_layout.addWidget(self.entity_selector)
+
+        self.custom_entity_label = QLabel("Custom Entity:")
+        controls_layout.addWidget(self.custom_entity_label)
+
+        self.custom_entity_selector = QComboBox()
+        self.custom_entity_selector.setMinimumWidth(260)
+        self.custom_entity_selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.custom_entity_selector.currentIndexChanged.connect(self.on_custom_entity_changed)
+        controls_layout.addWidget(self.custom_entity_selector)
+
+        controls_layout.addWidget(QLabel("Idioma:"))
+        self.language_selector = QComboBox()
+        self.language_selector.addItems(["es", "en", "fr", "de", "it", "pt", "pl", "es-mx", "zh", "en-gi"])
+        self.language_selector.setCurrentText("es")
+        controls_layout.addWidget(self.language_selector)
+
+        top_layout.addLayout(controls_layout)
+
+        route_layout = QHBoxLayout()
+        self.item_id_label = QLabel("Item ID:")
+        route_layout.addWidget(self.item_id_label)
+
+        self.item_id_input = QLineEdit()
+        self.item_id_input.setPlaceholderText("Introduce el ID numérico del item a actualizar")
+        route_layout.addWidget(self.item_id_input)
+
+        self.load_metadata_button = QPushButton("Load Metadata")
+        self.load_metadata_button.clicked.connect(self.load_metadata)
+        route_layout.addWidget(self.load_metadata_button)
+
+        self.generate_payload_button = QPushButton("Generate Payload")
+        self.generate_payload_button.clicked.connect(self.generate_payload)
+        route_layout.addWidget(self.generate_payload_button)
+
+        self.run_patch_button = QPushButton("Run PATCH")
+        self.run_patch_button.clicked.connect(self.run_patch)
+        route_layout.addWidget(self.run_patch_button)
+
+        top_layout.addLayout(route_layout)
+
+        self.form_info = QTextEdit()
+        self.form_info.setReadOnly(True)
+        self.form_info.setMaximumHeight(150)
+        self.form_info.setPlainText(
+            "Carga metadata para generar el formulario PATCH.\n"
+            "En PATCH, los campos multiidioma se envían como string simple usando Accept-Language.\n"
+            "El ID de ruta es obligatorio y debe ser numérico."
+        )
+        top_layout.addWidget(self.form_info)
+
+        top_layout.addWidget(QLabel("Formulario PATCH"))
+
+        self.form_container = QWidget()
+        self.form_layout = QFormLayout()
+        self.form_container.setLayout(self.form_layout)
+
+        self.form_scroll = QScrollArea()
+        self.form_scroll.setWidgetResizable(True)
+        self.form_scroll.setWidget(self.form_container)
+        self.form_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        top_layout.addWidget(self.form_scroll, 1)
+
+        top_widget.setLayout(top_layout)
+
+        bottom_splitter = QSplitter(Qt.Horizontal)
+
+        result_widget = QWidget()
+        result_layout = QVBoxLayout()
+        result_layout.setContentsMargins(0, 0, 0, 0)
+
+        results_header = QHBoxLayout()
+        results_header.addWidget(QLabel("Resultado PATCH"))
+
+        self.copy_json_button = QPushButton("Copy JSON")
+        self.copy_json_button.clicked.connect(self.copy_json)
+        results_header.addWidget(self.copy_json_button)
+
+        self.export_json_button = QPushButton("Export JSON")
+        self.export_json_button.clicked.connect(self.export_json)
+        results_header.addWidget(self.export_json_button)
+
+        results_header.addStretch()
+        result_layout.addLayout(results_header)
+
+        self.results_output = QTextEdit()
+        self.results_output.setReadOnly(True)
+        result_layout.addWidget(self.results_output)
+
+        result_widget.setLayout(result_layout)
+
+        payload_widget = QWidget()
+        payload_layout = QVBoxLayout()
+        payload_layout.setContentsMargins(0, 0, 0, 0)
+
+        payload_layout.addWidget(QLabel("Payload preview"))
+        self.payload_preview = QTextEdit()
+        self.payload_preview.setReadOnly(True)
+        payload_layout.addWidget(self.payload_preview)
+
+        payload_widget.setLayout(payload_layout)
+
+        bottom_splitter.addWidget(result_widget)
+        bottom_splitter.addWidget(payload_widget)
+        bottom_splitter.setStretchFactor(0, 3)
+        bottom_splitter.setStretchFactor(1, 2)
+
+        main_splitter.addWidget(top_widget)
+        main_splitter.addWidget(bottom_splitter)
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 2)
+
+        root_layout.addWidget(main_splitter)
+        self.setLayout(root_layout)
+
+    def on_entity_changed(self):
+        entity = self.entity_selector.currentText()
+        is_custom_entities = entity == "CustomEntities"
+        self.custom_entity_label.setVisible(is_custom_entities)
+        self.custom_entity_selector.setVisible(is_custom_entities)
+
+        label_map = {
+            "Products": "Product ID:",
+            "Variants": "Variant ID:",
+            "Categories": "Category ID:",
+            "CustomEntities": "Item ID:",
+        }
+        self.item_id_label.setText(label_map.get(entity, "Item ID:"))
+
+    def get_client(self):
+        api_key = self.main_window.get_api_key()
+        if not api_key:
+            raise ValueError("Debes introducir un API key.")
+        return SalesLayerApiClient(api_key)
+
+    def _request_headers(self, accept_language: str | None = None) -> dict:
+        api_key = self.main_window.get_api_key()
+        headers = {
+            "X-API-KEY": api_key,
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "User-Agent": "SalesLayerApiBrowser/0.1",
+        }
+        if accept_language:
+            headers["Accept-Language"] = accept_language
+        return headers
+
+    def _extract_custom_entity_display_denominator(self, schema: dict) -> str | None:
+        import re
+
+        for candidate in [schema.get("$id", ""), schema.get("title", ""), schema.get("description", "")]:
+            if not candidate:
+                continue
+            for pattern in [r"CustomEntities\('(.+?)'\)", r"CustomEntity\('(.+?)'\)"]:
+                match = re.search(pattern, candidate)
+                if match:
+                    return match.group(1).strip()
+
+        title = schema.get("title")
+        return str(title).strip() if title else None
+
+    def load_custom_entities_tables(self, force_refresh: bool = False):
+        previous_selection = self.get_selected_custom_entity_denominator()
+
+        if self.custom_entity_selector.count() > 0 and not force_refresh:
+            return
+
+        self.client = self.get_client()
+        metadata_text = self.client.get_metadata("CustomEntities")
+        data = json.loads(metadata_text)
+        schemas = data.get("value", [])
+
+        tables = []
+        for schema in schemas:
+            display_denominator = self._extract_custom_entity_display_denominator(schema)
+            if not display_denominator:
+                continue
+
+            title = schema.get("title", display_denominator)
+
+            tables.append({
+                "title": title,
+                "display_denominator": display_denominator,
+            })
+
+        unique = {}
+        for table in tables:
+            unique[table["display_denominator"]] = table
+
+        self.custom_entities_tables = sorted(unique.values(), key=lambda x: x["title"].lower())
+
+        if not self.custom_entities_tables:
+            raise ValueError("No se encontraron tablas de Custom Entities en la metadata.")
+
+        self.is_populating_custom_entities = True
+        try:
+            self.custom_entity_selector.clear()
+
+            for table in self.custom_entities_tables:
+                label = f"CustomEntities('{table['display_denominator']}')"
+                self.custom_entity_selector.addItem(label, table)
+
+            if previous_selection:
+                for index in range(self.custom_entity_selector.count()):
+                    data = self.custom_entity_selector.itemData(index)
+                    if isinstance(data, dict) and data.get("display_denominator") == previous_selection:
+                        self.custom_entity_selector.setCurrentIndex(index)
+                        break
+        finally:
+            self.is_populating_custom_entities = False
+
+    def get_selected_custom_entity_denominator(self):
+        data = self.custom_entity_selector.currentData()
+        if isinstance(data, dict):
+            return data.get("display_denominator")
+        return data
+
+    def on_custom_entity_changed(self):
+        if self.entity_selector.currentText() != "CustomEntities":
+            return
+
+        if self.is_populating_custom_entities or self.is_loading_metadata:
+            return
+
+        if not self.main_window.get_api_key():
+            return
+
+        if self.custom_entity_selector.count() == 0:
+            return
+
+        self.load_metadata()
+
+    def clear_form(self):
+        while self.form_layout.rowCount():
+            self.form_layout.removeRow(0)
+        self.form_widgets = {}
+
+    def _create_input_widget_for_property(self, prop: dict):
+        special_kind = prop.get("special_kind")
+        field_type = prop.get("type", "")
+
+        if special_kind == "status":
+            widget = QComboBox()
+            widget.addItem("", None)
+            enum_values = prop.get("enum_values") or ["V", "I", "D", "R", "v", "i", "d", "r"]
+            seen = set()
+            for value in enum_values:
+                if value in seen:
+                    continue
+                seen.add(value)
+                widget.addItem(str(value), value)
+            return {
+                "widget_type": "status",
+                "widget": widget,
+            }
+
+        if special_kind == "asset_ref":
+            widget = QLineEdit()
+            widget.setPlaceholderText("Nombre del fichero ya existente en el PIM")
+            return {
+                "widget_type": "asset_ref",
+                "widget": widget,
+            }
+
+        if field_type in {"boolean", "boolean | null"}:
+            widget = QComboBox()
+            widget.addItem("", None)
+            widget.addItem("true", True)
+            widget.addItem("false", False)
+            return {
+                "widget_type": "boolean",
+                "widget": widget,
+            }
+
+        widget = QLineEdit()
+
+        if prop.get("x_cultures"):
+            widget.setPlaceholderText("Valor del campo en el idioma seleccionado")
+        elif field_type in {"integer", "integer | null"}:
+            widget.setPlaceholderText("Introduce un número entero")
+        elif field_type in {"number", "number | null"}:
+            widget.setPlaceholderText("Introduce un número decimal")
+        else:
+            widget.setPlaceholderText("Introduce un valor")
+
+        return {
+            "widget_type": "simple",
+            "widget": widget,
+        }
+
+    def _get_product_patch_fields(self, properties: list[dict]) -> list[dict]:
+        fields = []
+        names = set()
+
+        def add_field(prop):
+            if prop["name"] in names:
+                return
+            names.add(prop["name"])
+            fields.append(prop)
+
+        excluded = {
+            "prod_id",
+            "prod_clone_id",
+            "prod_modify",
+            "prod_creation",
+            "prod_error_stat",
+            "prod_skeletor_qlty",
+            "cat_ref",
+        }
+
+        for prop in properties:
+            if prop["name"] in excluded:
+                continue
+
+            if prop["type"] in SIMPLE_TYPES:
+                if prop["name"] == "prod_stat" or prop.get("custom_type") == "status":
+                    prop = {**prop, "special_kind": "status"}
+                add_field(prop)
+            elif prop.get("custom_type") in ASSET_CUSTOM_TYPES:
+                add_field({**prop, "type": "string | null", "special_kind": "asset_ref"})
+
+        # Campos especiales conocidos en PATCH
+        for overlay in [
+            {"name": "cat_id", "title": "Category ID", "type": "integer | null", "required": False, "postable": True},
+            {"name": "typ_id", "title": "Attribute Set ID", "type": "integer | null", "required": False, "postable": True},
+        ]:
+            if overlay["name"] not in names:
+                add_field(overlay)
+
+        order_priority = {
+            "prod_ref": 1,
+            "prod_title": 2,
+            "prod_description": 3,
+            "prod_image": 4,
+            "prod_stat": 5,
+            "cat_id": 6,
+            "typ_id": 7,
+        }
+
+        fields.sort(key=lambda x: (order_priority.get(x["name"], 999), x["name"]))
+        return fields
+
+    def _get_category_patch_fields(self, properties: list[dict]) -> list[dict]:
+        fields = []
+        names = set()
+
+        def add_field(prop):
+            if prop["name"] in names:
+                return
+            names.add(prop["name"])
+            fields.append(prop)
+
+        excluded = {
+            "cat_id",
+            "cat_creation",
+            "cat_modify",
+            "cat_error_stat",
+            "cat_skeletor_qlty",
+            "cat_parent_ref",
+            "cat_parent_path",
+        }
+
+        for prop in properties:
+            if prop["name"] in excluded:
+                continue
+
+            if prop["type"] in SIMPLE_TYPES:
+                if prop["name"] == "cat_stat" or prop.get("custom_type") == "status":
+                    prop = {**prop, "special_kind": "status"}
+                add_field(prop)
+            elif prop.get("custom_type") in ASSET_CUSTOM_TYPES:
+                add_field({**prop, "type": "string | null", "special_kind": "asset_ref"})
+
+        if "cat_parent_id" not in names:
+            add_field({
+                "name": "cat_parent_id",
+                "title": "Parent Category ID",
+                "type": "integer | null",
+                "required": False,
+            })
+
+        order_priority = {
+            "cat_ref": 1,
+            "cat_title": 2,
+            "cat_description": 3,
+            "cat_image": 4,
+            "cat_stat": 5,
+            "cat_parent_id": 6,
+        }
+
+        fields.sort(key=lambda x: (order_priority.get(x["name"], 999), x["name"]))
+        return fields
+
+    def _get_variant_patch_fields(self, properties: list[dict]) -> list[dict]:
+        fields = []
+        names = set()
+
+        def add_field(prop):
+            if prop["name"] in names:
+                return
+            names.add(prop["name"])
+            fields.append(prop)
+
+        excluded = {
+            "frmt_id",
+            "prod_ref",
+            "frmt_ref",
+            "frmt_modify",
+            "frmt_creation",
+            "frmt_error_stat",
+            "frmt_skeletor_qlty",
+        }
+
+        for prop in properties:
+            if prop["name"] in excluded:
+                continue
+
+            if prop["type"] in SIMPLE_TYPES:
+                if prop["name"] == "frmt_stat" or prop.get("custom_type") == "status":
+                    prop = {**prop, "special_kind": "status"}
+                add_field(prop)
+            elif prop.get("custom_type") in ASSET_CUSTOM_TYPES:
+                add_field({**prop, "type": "string | null", "special_kind": "asset_ref"})
+
+        # prod_id es especial y sí puede ir en PATCH
+        if "prod_id" not in names:
+            add_field({
+                "name": "prod_id",
+                "title": "Product ID / Reference",
+                "type": "string | null",
+                "required": False,
+            })
+
+        order_priority = {
+            "prod_id": 1,
+            "frmt_stat": 2,
+        }
+
+        fields.sort(key=lambda x: (order_priority.get(x["name"], 999), x["name"]))
+        return fields
+
+    def _get_custom_entity_patch_fields(self, properties: list[dict]) -> list[dict]:
+        fields = []
+        names = set()
+
+        def add_field(prop):
+            if prop["name"] in names:
+                return
+            names.add(prop["name"])
+            fields.append(prop)
+
+        for prop in properties:
+            name_lower = prop["name"].lower()
+
+            # no asignables en update custom entity
+            if name_lower.endswith("_id"):
+                continue
+            if name_lower.endswith("_modify"):
+                continue
+            if name_lower.endswith("_creation"):
+                continue
+            if name_lower.endswith("_ref"):
+                continue
+
+            if prop["type"] in SIMPLE_TYPES:
+                if prop.get("custom_type") == "status":
+                    prop = {**prop, "special_kind": "status"}
+                add_field(prop)
+            elif prop.get("custom_type") in ASSET_CUSTOM_TYPES:
+                add_field({**prop, "type": "string | null", "special_kind": "asset_ref"})
+
+        fields.sort(key=lambda x: x["name"])
+        return fields
+
+    def _get_patch_fields_for_entity(self, entity: str, properties: list[dict]) -> list[dict]:
+        if entity == "Products":
+            return self._get_product_patch_fields(properties)
+        if entity == "Categories":
+            return self._get_category_patch_fields(properties)
+        if entity == "Variants":
+            return self._get_variant_patch_fields(properties)
+        if entity == "CustomEntities":
+            return self._get_custom_entity_patch_fields(properties)
+
+        return [prop for prop in properties if prop["type"] in SIMPLE_TYPES]
+
+    def build_form(self):
+        self.clear_form()
+
+        for prop in self.current_patchable_properties:
+            label_text = f'{prop["name"]} | {prop["title"]} | {prop["type"]}'
+
+            special_kind = prop.get("special_kind")
+            if prop.get("x_cultures"):
+                label_text += " | translated field"
+            if special_kind == "asset_ref":
+                label_text += " | existing file/image"
+            elif special_kind == "status":
+                label_text += " | status"
+
+            widget_info = self._create_input_widget_for_property(prop)
+            self.form_layout.addRow(QLabel(label_text), widget_info["widget"])
+            self.form_widgets[prop["name"]] = {
+                **widget_info,
+                "property": prop,
+            }
+
+        if not self.current_patchable_properties:
+            self.form_layout.addRow(QLabel("No hay campos disponibles para PATCH en esta entidad."))
+
+    def load_metadata(self):
+        if self.is_loading_metadata:
+            return
+
+        try:
+            self.is_loading_metadata = True
+            self.client = self.get_client()
+            entity = self.entity_selector.currentText()
+
+            if entity == "CustomEntities":
+                self.load_custom_entities_tables(force_refresh=False)
+
+                denominator = self.get_selected_custom_entity_denominator()
+                if not denominator:
+                    raise ValueError("No se ha podido determinar la tabla de Custom Entity.")
+
+                metadata_text = self.client.get_metadata("CustomEntities", denominator)
+                properties = extract_properties_from_metadata(
+                    metadata_text,
+                    selected_entity="CustomEntities",
+                    custom_entity_denominator=denominator
+                )
+            else:
+                metadata_text = self.client.get_metadata(entity)
+                properties = extract_properties_from_metadata(metadata_text, entity)
+
+            self.current_properties = properties
+            self.current_patchable_properties = self._get_patch_fields_for_entity(entity, properties)
+
+            self.build_form()
+            self.payload_preview.clear()
+            self.results_output.clear()
+            self.last_payload = None
+            self.last_result_data = None
+
+            info_lines = [
+                f"Campos disponibles para PATCH: {len(self.current_patchable_properties)}",
+                "El ID de ruta es obligatorio y debe ser numérico.",
+            ]
+
+            if entity == "Products":
+                info_lines.append("PATCH Products usa /Products(productId).")
+                info_lines.append("Los campos traducibles se mandan como string simple usando Accept-Language.")
+            elif entity == "Categories":
+                info_lines.append("PATCH Categories usa /Categories(categoryId).")
+                info_lines.append("Los campos traducibles se mandan como string simple usando Accept-Language.")
+            elif entity == "Variants":
+                info_lines.append("PATCH Variants usa /variants(variantId).")
+            elif entity == "CustomEntities":
+                info_lines.append(f"Tabla seleccionada: {self.get_selected_custom_entity_denominator()}")
+                info_lines.append("PATCH Custom Entity probará primero el endpoint documentado y, si no existe, fallback plural.")
+
+            self.form_info.setPlainText("\n".join(info_lines))
+
+            QMessageBox.information(
+                self,
+                "Metadata cargada",
+                f"Se han preparado {len(self.current_patchable_properties)} campos para PATCH."
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error cargando metadata", str(e))
+        finally:
+            self.is_loading_metadata = False
+
+    def _read_widget_value(self, widget_info: dict):
+        prop = widget_info["property"]
+        field_type = prop.get("type", "")
+        widget_type = widget_info["widget_type"]
+
+        if widget_type in {"boolean", "status"}:
+            return widget_info["widget"].currentData()
+
+        raw = widget_info["widget"].text().strip()
+
+        if raw == "":
+            return None
+
+        if field_type in {"integer", "integer | null"}:
+            try:
+                return int(raw)
+            except ValueError as e:
+                raise ValueError(f"El campo {prop['name']} requiere un entero.") from e
+
+        if field_type in {"number", "number | null"}:
+            try:
+                return float(raw.replace(",", "."))
+            except ValueError as e:
+                raise ValueError(f"El campo {prop['name']} requiere un número.") from e
+
+        return raw
+
+    def collect_payload(self) -> dict:
+        payload = {}
+
+        for field_name, widget_info in self.form_widgets.items():
+            value = self._read_widget_value(widget_info)
+            if value is None:
+                continue
+            payload[field_name] = value
+
+        return payload
+
+    def generate_payload(self):
+        try:
+            payload = self.collect_payload()
+            self.last_payload = payload
+            self.payload_preview.setPlainText(
+                json.dumps(payload, indent=2, ensure_ascii=False)
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error generando payload", str(e))
+
+    def _get_route_item_id(self) -> int:
+        raw = self.item_id_input.text().strip()
+        if not raw:
+            raise ValueError("Debes indicar el ID numérico del item a actualizar.")
+        try:
+            return int(raw)
+        except ValueError as e:
+            raise ValueError("El ID de ruta debe ser numérico.") from e
+
+    def _patch_request(self, entity: str, item_id: int, payload: dict, custom_entity_denominator: str | None = None) -> dict:
+        headers = self._request_headers(self.language_selector.currentText().strip())
+
+        candidate_urls = []
+
+        if entity == "Products":
+            candidate_urls = [f"{BASE_URL}/Products({item_id})"]
+        elif entity == "Categories":
+            candidate_urls = [f"{BASE_URL}/Categories({item_id})"]
+        elif entity == "Variants":
+            candidate_urls = [f"{BASE_URL}/variants({item_id})"]
+        elif entity == "CustomEntities":
+            if not custom_entity_denominator:
+                raise ValueError("Debes seleccionar una tabla de Custom Entity.")
+            encoded = quote(custom_entity_denominator, safe="")
+            candidate_urls = [
+                f"{BASE_URL}/CustomEntity('{encoded}')/Item({item_id})",
+                f"{BASE_URL}/CustomEntities('{encoded}')/Item({item_id})",
+            ]
+        else:
+            raise ValueError(f"Entidad no soportada para PATCH: {entity}")
+
+        last_error = None
+
+        for url in candidate_urls:
+            response = requests.patch(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+
+            if response.status_code == 404 and len(candidate_urls) > 1:
+                last_error = response
+                continue
+
+            if not response.ok:
+                detail = response.text.strip()
+                if detail:
+                    raise ValueError(
+                        f"{response.status_code} Client Error for url: {url}\n\nRespuesta API:\n{detail}"
+                    )
+                response.raise_for_status()
+
+            if not response.text.strip():
+                return {
+                    "status_code": response.status_code,
+                    "message": "No Content",
+                    "request_url": url,
+                }
+
+            try:
+                data = response.json()
+                data["_request_url"] = url
+                return data
+            except ValueError:
+                return {
+                    "status_code": response.status_code,
+                    "raw_response": response.text,
+                    "request_url": url,
+                }
+
+        if last_error is not None:
+            detail = last_error.text.strip()
+            raise ValueError(
+                f"{last_error.status_code} Client Error for url: {last_error.url}\n\nRespuesta API:\n{detail}"
+            )
+
+        raise ValueError("No se pudo ejecutar PATCH.")
+
+    def run_patch(self):
+        try:
+            entity = self.entity_selector.currentText()
+            item_id = self._get_route_item_id()
+
+            payload = self.collect_payload()
+            if not payload:
+                raise ValueError("El payload está vacío. Introduce al menos un valor a actualizar.")
+
+            self.last_payload = payload
+            self.payload_preview.setPlainText(
+                json.dumps(payload, indent=2, ensure_ascii=False)
+            )
+
+            denominator = None
+            if entity == "CustomEntities":
+                denominator = self.get_selected_custom_entity_denominator()
+
+            data = self._patch_request(entity, item_id, payload, denominator)
+            self.last_result_data = data
+
+            self.results_output.setPlainText(
+                json.dumps(data, indent=2, ensure_ascii=False)
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error ejecutando PATCH", str(e))
+
+    def copy_json(self):
+        text = self.results_output.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, "Sin contenido", "No hay JSON para copiar.")
+            return
+
+        QGuiApplication.clipboard().setText(text)
+        QMessageBox.information(self, "Copiado", "El JSON se ha copiado al portapapeles.")
+
+    def export_json(self):
+        if self.last_result_data is None:
+            QMessageBox.information(self, "Sin contenido", "No hay JSON para exportar.")
+            return
+
+        entity = self.entity_selector.currentText().lower()
+        default_name = f"{entity}_patch_result.json"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Guardar JSON",
+            str(Path.home() / default_name),
+            "JSON Files (*.json);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(self.last_result_data, f, indent=2, ensure_ascii=False)
+
+            QMessageBox.information(self, "Exportado", f"JSON guardado en:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error exportando JSON", str(e))
