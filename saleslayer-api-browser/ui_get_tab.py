@@ -11,10 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
 
 from api_client import SalesLayerApiClient
-from metadata_parser import (
-    extract_properties_from_metadata,
-    extract_custom_entities_tables,
-)
+from metadata_parser import extract_properties_from_metadata
 from query_builder import build_params
 
 
@@ -215,8 +212,39 @@ class GetTab(QWidget):
             raise ValueError("Debes introducir un API key.")
         return SalesLayerApiClient(api_key)
 
+    def _extract_custom_entity_display_denominator(self, schema: dict) -> str | None:
+        for candidate in [schema.get("$id", ""), schema.get("title", ""), schema.get("description", "")]:
+            if not candidate:
+                continue
+            import re
+            for pattern in [r"CustomEntities\('(.+?)'\)", r"CustomEntity\('(.+?)'\)"]:
+                match = re.search(pattern, candidate)
+                if match:
+                    return match.group(1).strip()
+
+        title = schema.get("title")
+        return str(title).strip() if title else None
+
+    def _extract_custom_entity_post_denominator(self, schema: dict) -> str | None:
+        storage_name = schema.get("x-storage-object-name")
+        if storage_name:
+            return str(storage_name).strip()
+        return self._extract_custom_entity_display_denominator(schema)
+
+    def get_selected_custom_entity_metadata_denominator(self):
+        data = self.custom_entity_selector.currentData()
+        if isinstance(data, dict):
+            return data.get("display_denominator")
+        return data
+
+    def get_selected_custom_entity_post_denominator(self):
+        data = self.custom_entity_selector.currentData()
+        if isinstance(data, dict):
+            return data.get("post_denominator")
+        return data
+
     def get_selected_custom_entity_denominator(self):
-        return self.custom_entity_selector.currentData()
+        return self.get_selected_custom_entity_metadata_denominator()
 
     def get_allowed_operators_for_type(self, field_type: str):
         normalized_type = (field_type or "").strip().lower()
@@ -248,13 +276,35 @@ class GetTab(QWidget):
         self.populate_operator_selector(field_type)
 
     def load_custom_entities_tables(self, force_refresh: bool = False):
-        previous_selection = self.get_selected_custom_entity_denominator()
+        previous_selection = self.get_selected_custom_entity_metadata_denominator()
 
         if self.custom_entity_selector.count() > 0 and not force_refresh:
             return
 
         metadata_text = self.client.get_metadata("CustomEntities")
-        self.custom_entities_tables = extract_custom_entities_tables(metadata_text)
+        data = json.loads(metadata_text)
+        schemas = data.get("value", [])
+
+        tables = []
+        for schema in schemas:
+            display_denominator = self._extract_custom_entity_display_denominator(schema)
+            if not display_denominator:
+                continue
+
+            post_denominator = self._extract_custom_entity_post_denominator(schema)
+            title = schema.get("title", display_denominator)
+
+            tables.append({
+                "title": title,
+                "display_denominator": display_denominator,
+                "post_denominator": post_denominator or display_denominator,
+            })
+
+        unique = {}
+        for table in tables:
+            unique[table["display_denominator"]] = table
+
+        self.custom_entities_tables = sorted(unique.values(), key=lambda x: x["title"].lower())
 
         if not self.custom_entities_tables:
             raise ValueError("No se encontraron tablas de Custom Entities en la metadata.")
@@ -264,15 +314,14 @@ class GetTab(QWidget):
             self.custom_entity_selector.clear()
 
             for table in self.custom_entities_tables:
-                self.custom_entity_selector.addItem(
-                    table["denominator"],
-                    table["denominator"]
-                )
+                self.custom_entity_selector.addItem(table["title"], table)
 
             if previous_selection:
-                index = self.custom_entity_selector.findData(previous_selection)
-                if index >= 0:
-                    self.custom_entity_selector.setCurrentIndex(index)
+                for index in range(self.custom_entity_selector.count()):
+                    data = self.custom_entity_selector.itemData(index)
+                    if isinstance(data, dict) and data.get("display_denominator") == previous_selection:
+                        self.custom_entity_selector.setCurrentIndex(index)
+                        break
         finally:
             self.is_populating_custom_entities = False
 
@@ -288,7 +337,7 @@ class GetTab(QWidget):
             if entity == "CustomEntities":
                 self.load_custom_entities_tables(force_refresh=False)
 
-                denominator = self.get_selected_custom_entity_denominator()
+                denominator = self.get_selected_custom_entity_metadata_denominator()
                 if not denominator:
                     raise ValueError("No se ha podido determinar la tabla de Custom Entity.")
 
@@ -342,7 +391,10 @@ class GetTab(QWidget):
 
             extra = ""
             if entity == "CustomEntities":
-                extra = f" Tabla: {self.get_selected_custom_entity_denominator()}."
+                extra = (
+                    f" Tabla metadata/read: {self.get_selected_custom_entity_metadata_denominator()}."
+                    f" Tabla create/post: {self.get_selected_custom_entity_post_denominator()}."
+                )
 
             QMessageBox.information(
                 self,
@@ -455,7 +507,7 @@ class GetTab(QWidget):
 
             denominator = None
             if entity == "CustomEntities":
-                denominator = self.get_selected_custom_entity_denominator()
+                denominator = self.get_selected_custom_entity_metadata_denominator()
                 if not denominator:
                     raise ValueError("Debes seleccionar una tabla de Custom Entity.")
 
@@ -484,7 +536,7 @@ class GetTab(QWidget):
             return
 
         entity = self.entity_selector.currentText().lower()
-        denominator = self.get_selected_custom_entity_denominator()
+        denominator = self.get_selected_custom_entity_metadata_denominator()
 
         if entity == "customentities" and denominator:
             safe_denominator = (

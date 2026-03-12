@@ -1,5 +1,8 @@
 import json
 from pathlib import Path
+from urllib.parse import quote
+
+import requests
 
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
@@ -10,10 +13,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtCore import Qt
 
 from api_client import SalesLayerApiClient
-from metadata_parser import (
-    extract_properties_from_metadata,
-    extract_custom_entities_tables,
-)
+from metadata_parser import extract_properties_from_metadata
 
 
 SIMPLE_TYPES = {
@@ -28,6 +28,7 @@ SIMPLE_TYPES = {
 }
 
 ASSET_CUSTOM_TYPES = {"image_pack", "file"}
+BASE_URL = "https://api2.saleslayer.com/rest/Catalog"
 
 
 class PostTab(QWidget):
@@ -54,7 +55,6 @@ class PostTab(QWidget):
 
         main_splitter = QSplitter(Qt.Vertical)
 
-        # TOP AREA
         top_widget = QWidget()
         top_layout = QVBoxLayout()
         top_layout.setContentsMargins(0, 0, 0, 0)
@@ -120,7 +120,6 @@ class PostTab(QWidget):
 
         top_widget.setLayout(top_layout)
 
-        # BOTTOM AREA
         bottom_splitter = QSplitter(Qt.Horizontal)
 
         result_widget = QWidget()
@@ -182,17 +181,109 @@ class PostTab(QWidget):
             raise ValueError("Debes introducir un API key.")
         return SalesLayerApiClient(api_key)
 
+    def _request_headers(self, accept_language: str | None = None) -> dict:
+        api_key = self.main_window.get_api_key()
+        headers = {
+            "X-API-KEY": api_key,
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "User-Agent": "SalesLayerApiBrowser/0.1",
+        }
+        if accept_language:
+            headers["Accept-Language"] = accept_language
+        return headers
+
+    def _post_request(self, entity: str, payload: dict, denominator: str | None = None) -> dict:
+        if entity == "CustomEntities":
+            if not denominator:
+                raise ValueError("Debes seleccionar una tabla de Custom Entity.")
+            encoded = quote(denominator, safe="")
+            url = f"{BASE_URL}/CustomEntities('{encoded}')"
+        else:
+            url = f"{BASE_URL}/{entity}"
+
+        response = requests.post(
+            url,
+            headers=self._request_headers(self.language_selector.currentText().strip()),
+            json=payload,
+            timeout=30
+        )
+
+        if not response.ok:
+            detail = response.text.strip()
+            if detail:
+                raise ValueError(
+                    f"{response.status_code} Client Error for url: {url}\n\nRespuesta API:\n{detail}"
+                )
+            response.raise_for_status()
+
+        if not response.text.strip():
+            return {"status_code": response.status_code, "message": "Empty response body"}
+
+        try:
+            return response.json()
+        except ValueError:
+            return {
+                "status_code": response.status_code,
+                "raw_response": response.text
+            }
+
+    def _extract_custom_entity_display_denominator(self, schema: dict) -> str | None:
+        import re
+
+        for candidate in [schema.get("$id", ""), schema.get("title", ""), schema.get("description", "")]:
+            if not candidate:
+                continue
+            for pattern in [r"CustomEntities\('(.+?)'\)", r"CustomEntity\('(.+?)'\)"]:
+                match = re.search(pattern, candidate)
+                if match:
+                    return match.group(1).strip()
+
+        title = schema.get("title")
+        return str(title).strip() if title else None
+
+    def get_selected_custom_entity_metadata_denominator(self):
+        data = self.custom_entity_selector.currentData()
+        if isinstance(data, dict):
+            return data.get("display_denominator")
+        return data
+
+    def get_selected_custom_entity_post_denominator(self):
+        # En este tenant, Swagger confirma que create usa el visible
+        return self.get_selected_custom_entity_metadata_denominator()
+
     def get_selected_custom_entity_denominator(self):
-        return self.custom_entity_selector.currentData()
+        return self.get_selected_custom_entity_metadata_denominator()
 
     def load_custom_entities_tables(self, force_refresh: bool = False):
-        previous_selection = self.get_selected_custom_entity_denominator()
+        previous_selection = self.get_selected_custom_entity_metadata_denominator()
 
         if self.custom_entity_selector.count() > 0 and not force_refresh:
             return
 
+        self.client = self.get_client()
         metadata_text = self.client.get_metadata("CustomEntities")
-        self.custom_entities_tables = extract_custom_entities_tables(metadata_text)
+        data = json.loads(metadata_text)
+        schemas = data.get("value", [])
+
+        tables = []
+        for schema in schemas:
+            display_denominator = self._extract_custom_entity_display_denominator(schema)
+            if not display_denominator:
+                continue
+
+            title = schema.get("title", display_denominator)
+
+            tables.append({
+                "title": title,
+                "display_denominator": display_denominator,
+            })
+
+        unique = {}
+        for table in tables:
+            unique[table["display_denominator"]] = table
+
+        self.custom_entities_tables = sorted(unique.values(), key=lambda x: x["title"].lower())
 
         if not self.custom_entities_tables:
             raise ValueError("No se encontraron tablas de Custom Entities en la metadata.")
@@ -202,15 +293,15 @@ class PostTab(QWidget):
             self.custom_entity_selector.clear()
 
             for table in self.custom_entities_tables:
-                self.custom_entity_selector.addItem(
-                    table["denominator"],
-                    table["denominator"]
-                )
+                label = f"CustomEntities('{table['display_denominator']}')"
+                self.custom_entity_selector.addItem(label, table)
 
             if previous_selection:
-                index = self.custom_entity_selector.findData(previous_selection)
-                if index >= 0:
-                    self.custom_entity_selector.setCurrentIndex(index)
+                for index in range(self.custom_entity_selector.count()):
+                    data = self.custom_entity_selector.itemData(index)
+                    if isinstance(data, dict) and data.get("display_denominator") == previous_selection:
+                        self.custom_entity_selector.setCurrentIndex(index)
+                        break
         finally:
             self.is_populating_custom_entities = False
 
@@ -359,8 +450,7 @@ class PostTab(QWidget):
 
         post_fields = [
             prop for prop in properties
-            if prop.get("postable", False)
-            and prop["type"] in SIMPLE_TYPES
+            if prop["type"] in SIMPLE_TYPES
             and prop["name"] not in excluded
             and prop["name"] not in {"prod_title", "prod_description", "prod_image", "prod_stat", "cat_id", "typ_id"}
         ]
@@ -403,17 +493,6 @@ class PostTab(QWidget):
         }
 
         for prop in properties:
-            if not prop.get("postable", False):
-                continue
-            if prop["name"] in excluded:
-                continue
-
-            if prop["type"] in SIMPLE_TYPES:
-                if prop.get("custom_type") == "status":
-                    prop = {**prop, "special_kind": "status"}
-                add_field(prop)
-
-        for prop in properties:
             if prop["name"] in excluded:
                 continue
 
@@ -421,9 +500,13 @@ class PostTab(QWidget):
                 add_field({**prop, "required": True})
                 continue
 
-            if prop.get("x_cultures"):
+            if prop["type"] in SIMPLE_TYPES:
+                if prop.get("custom_type") == "status":
+                    prop = {**prop, "special_kind": "status"}
+                add_field(prop)
+
+            if str(prop.get("x_cultures", "")).lower() == "true":
                 add_field({**prop, "special_kind": "multilang_json"})
-                continue
 
             if prop.get("custom_type") in ASSET_CUSTOM_TYPES:
                 add_field({
@@ -486,16 +569,11 @@ class PostTab(QWidget):
             if prop["name"] in excluded:
                 continue
 
-            if prop.get("postable", False) and prop["type"] in SIMPLE_TYPES:
+            if prop["type"] in SIMPLE_TYPES:
                 add_field(prop)
 
-        for prop in properties:
-            if prop["name"] in excluded:
-                continue
-
-            if prop.get("x_cultures"):
+            if str(prop.get("x_cultures", "")).lower() == "true":
                 add_field({**prop, "special_kind": "multilang_json"})
-                continue
 
             if prop.get("custom_type") in ASSET_CUSTOM_TYPES:
                 add_field({
@@ -512,6 +590,44 @@ class PostTab(QWidget):
         fields.sort(key=lambda x: (order_priority.get(x["name"], 999), x["name"]))
         return fields
 
+    def _get_custom_entity_post_fields(self, properties: list[dict]) -> list[dict]:
+        fields = []
+        names = set()
+
+        def add_field(prop):
+            if prop["name"] in names:
+                return
+            names.add(prop["name"])
+            fields.append(prop)
+
+        for prop in properties:
+            name_lower = prop["name"].lower()
+
+            if name_lower.endswith("_creation"):
+                continue
+            if name_lower.endswith("_modify"):
+                continue
+            if name_lower.endswith("_id"):
+                continue
+
+            if prop["type"] in SIMPLE_TYPES:
+                if prop.get("custom_type") == "status":
+                    prop = {**prop, "special_kind": "status"}
+                add_field(prop)
+
+            if str(prop.get("x_cultures", "")).lower() == "true":
+                add_field({**prop, "special_kind": "multilang_json"})
+
+            if prop.get("custom_type") in ASSET_CUSTOM_TYPES:
+                add_field({
+                    **prop,
+                    "type": "string | null",
+                    "special_kind": "asset_ref",
+                })
+
+        fields.sort(key=lambda x: x["name"])
+        return fields
+
     def _get_post_fields_for_entity(self, entity: str, properties: list[dict]) -> list[dict]:
         if entity == "Products":
             return self._get_product_post_fields(properties)
@@ -522,10 +638,10 @@ class PostTab(QWidget):
         if entity == "Variants":
             return self._get_variant_post_fields(properties)
 
-        return [
-            prop for prop in properties
-            if prop.get("postable", False) and prop["type"] in SIMPLE_TYPES
-        ]
+        if entity == "CustomEntities":
+            return self._get_custom_entity_post_fields(properties)
+
+        return [prop for prop in properties if prop["type"] in SIMPLE_TYPES]
 
     def build_form(self):
         self.clear_form()
@@ -565,7 +681,7 @@ class PostTab(QWidget):
             if entity == "CustomEntities":
                 self.load_custom_entities_tables(force_refresh=False)
 
-                denominator = self.get_selected_custom_entity_denominator()
+                denominator = self.get_selected_custom_entity_metadata_denominator()
                 if not denominator:
                     raise ValueError("No se ha podido determinar la tabla de Custom Entity.")
 
@@ -603,7 +719,8 @@ class PostTab(QWidget):
                 info_lines.append("Variants fuerza prod_id y admite campos de imagen/archivo y multiidioma detectados por metadata.")
                 info_lines.append('Para campos multiidioma usa JSON como {"es":"Texto","en":"Text"}')
             elif entity == "CustomEntities":
-                info_lines.append(f"Tabla seleccionada: {self.get_selected_custom_entity_denominator()}")
+                info_lines.append(f"Tabla metadata/read: {self.get_selected_custom_entity_metadata_denominator()}")
+                info_lines.append(f"Tabla create/post: {self.get_selected_custom_entity_post_denominator()}")
 
             self.form_info.setPlainText("\n".join(info_lines))
 
@@ -698,7 +815,6 @@ class PostTab(QWidget):
 
     def run_post(self):
         try:
-            self.client = self.get_client()
             entity = self.entity_selector.currentText()
 
             payload = self.collect_payload()
@@ -712,16 +828,11 @@ class PostTab(QWidget):
 
             denominator = None
             if entity == "CustomEntities":
-                denominator = self.get_selected_custom_entity_denominator()
+                denominator = self.get_selected_custom_entity_post_denominator()
                 if not denominator:
                     raise ValueError("Debes seleccionar una tabla de Custom Entity.")
 
-            data = self.client.post_data(
-                entity,
-                payload,
-                denominator,
-                accept_language=self.language_selector.currentText().strip()
-            )
+            data = self._post_request(entity, payload, denominator)
             self.last_result_data = data
 
             self.results_output.setPlainText(
@@ -746,7 +857,7 @@ class PostTab(QWidget):
             return
 
         entity = self.entity_selector.currentText().lower()
-        denominator = self.get_selected_custom_entity_denominator()
+        denominator = self.get_selected_custom_entity_post_denominator()
 
         if entity == "customentities" and denominator:
             safe_denominator = (

@@ -32,10 +32,10 @@ def _normalize_type(type_value):
     return str(type_value) if type_value is not None else "unknown"
 
 
-def _extract_custom_entity_denominator_from_schema(schema: dict) -> str | None:
+def _extract_custom_entity_display_denominator_from_schema(schema: dict) -> str | None:
     candidates = [
-        schema.get("title", ""),
         schema.get("$id", ""),
+        schema.get("title", ""),
         schema.get("description", ""),
     ]
 
@@ -51,9 +51,21 @@ def _extract_custom_entity_denominator_from_schema(schema: dict) -> str | None:
         for pattern in patterns:
             match = re.search(pattern, candidate)
             if match:
-                return match.group(1)
+                return match.group(1).strip()
+
+    title = schema.get("title")
+    if title:
+        return str(title).strip()
 
     return None
+
+
+def _extract_custom_entity_post_denominator_from_schema(schema: dict) -> str | None:
+    storage_name = schema.get("x-storage-object-name")
+    if storage_name:
+        return str(storage_name).strip()
+
+    return _extract_custom_entity_display_denominator_from_schema(schema)
 
 
 def extract_custom_entities_tables(metadata_text: str) -> list[dict]:
@@ -66,21 +78,24 @@ def extract_custom_entities_tables(metadata_text: str) -> list[dict]:
     tables = []
 
     for schema in schemas:
-        denominator = _extract_custom_entity_denominator_from_schema(schema)
-        if not denominator:
+        display_denominator = _extract_custom_entity_display_denominator_from_schema(schema)
+        if not display_denominator:
             continue
 
-        title = schema.get("title", denominator)
+        post_denominator = _extract_custom_entity_post_denominator_from_schema(schema)
+        title = schema.get("title", display_denominator)
+
         tables.append({
-            "denominator": denominator,
+            "display_denominator": display_denominator,
+            "post_denominator": post_denominator or display_denominator,
             "title": title,
         })
 
     unique = {}
     for table in tables:
-        unique[table["denominator"]] = table
+        unique[table["display_denominator"]] = table
 
-    return sorted(unique.values(), key=lambda x: x["denominator"].lower())
+    return sorted(unique.values(), key=lambda x: x["title"].lower())
 
 
 def _select_schema(
@@ -91,8 +106,8 @@ def _select_schema(
     if selected_entity == "CustomEntities":
         if custom_entity_denominator:
             for schema in schemas:
-                denominator = _extract_custom_entity_denominator_from_schema(schema)
-                if denominator == custom_entity_denominator:
+                display_denominator = _extract_custom_entity_display_denominator_from_schema(schema)
+                if display_denominator == custom_entity_denominator:
                     return schema
         if schemas:
             return schemas[0]
