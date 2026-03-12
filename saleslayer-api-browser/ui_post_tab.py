@@ -4,9 +4,10 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
     QTextEdit, QSizePolicy, QMessageBox, QFileDialog, QLineEdit,
-    QScrollArea, QFormLayout
+    QScrollArea, QFormLayout, QSplitter
 )
 from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import Qt
 
 from api_client import SalesLayerApiClient
 from metadata_parser import (
@@ -25,6 +26,8 @@ SIMPLE_TYPES = {
     "boolean",
     "boolean | null",
 }
+
+ASSET_CUSTOM_TYPES = {"image_pack", "file"}
 
 
 class PostTab(QWidget):
@@ -47,7 +50,14 @@ class PostTab(QWidget):
         self.on_entity_changed()
 
     def build_ui(self):
-        main_layout = QVBoxLayout()
+        root_layout = QVBoxLayout()
+
+        main_splitter = QSplitter(Qt.Vertical)
+
+        # TOP AREA
+        top_widget = QWidget()
+        top_layout = QVBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
 
         controls_layout = QHBoxLayout()
 
@@ -84,18 +94,19 @@ class PostTab(QWidget):
         self.run_post_button.clicked.connect(self.run_post)
         controls_layout.addWidget(self.run_post_button)
 
-        main_layout.addLayout(controls_layout)
+        top_layout.addLayout(controls_layout)
 
         self.form_info = QTextEdit()
         self.form_info.setReadOnly(True)
-        self.form_info.setMaximumHeight(160)
+        self.form_info.setMaximumHeight(140)
         self.form_info.setPlainText(
             "Carga metadata para generar el formulario POST.\n"
-            "Esta versión soporta campos simples y overlay específico para Products."
+            "Products usa overlay específico.\n"
+            "Categories y Variants soportan campos simples, multiidioma JSON e imágenes/archivos."
         )
-        main_layout.addWidget(self.form_info)
+        top_layout.addWidget(self.form_info)
 
-        main_layout.addWidget(QLabel("Formulario POST"))
+        top_layout.addWidget(QLabel("Formulario POST"))
 
         self.form_container = QWidget()
         self.form_layout = QFormLayout()
@@ -104,13 +115,17 @@ class PostTab(QWidget):
         self.form_scroll = QScrollArea()
         self.form_scroll.setWidgetResizable(True)
         self.form_scroll.setWidget(self.form_container)
-        main_layout.addWidget(self.form_scroll)
+        self.form_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        top_layout.addWidget(self.form_scroll, 1)
 
-        main_layout.addWidget(QLabel("Payload preview"))
-        self.payload_preview = QTextEdit()
-        self.payload_preview.setReadOnly(True)
-        self.payload_preview.setMaximumHeight(180)
-        main_layout.addWidget(self.payload_preview)
+        top_widget.setLayout(top_layout)
+
+        # BOTTOM AREA
+        bottom_splitter = QSplitter(Qt.Horizontal)
+
+        result_widget = QWidget()
+        result_layout = QVBoxLayout()
+        result_layout.setContentsMargins(0, 0, 0, 0)
 
         results_header = QHBoxLayout()
         results_header.addWidget(QLabel("Resultado POST"))
@@ -124,13 +139,37 @@ class PostTab(QWidget):
         results_header.addWidget(self.export_json_button)
 
         results_header.addStretch()
-        main_layout.addLayout(results_header)
+        result_layout.addLayout(results_header)
 
         self.results_output = QTextEdit()
         self.results_output.setReadOnly(True)
-        main_layout.addWidget(self.results_output)
+        result_layout.addWidget(self.results_output)
 
-        self.setLayout(main_layout)
+        result_widget.setLayout(result_layout)
+
+        payload_widget = QWidget()
+        payload_layout = QVBoxLayout()
+        payload_layout.setContentsMargins(0, 0, 0, 0)
+
+        payload_layout.addWidget(QLabel("Payload preview"))
+        self.payload_preview = QTextEdit()
+        self.payload_preview.setReadOnly(True)
+        payload_layout.addWidget(self.payload_preview)
+
+        payload_widget.setLayout(payload_layout)
+
+        bottom_splitter.addWidget(result_widget)
+        bottom_splitter.addWidget(payload_widget)
+        bottom_splitter.setStretchFactor(0, 3)
+        bottom_splitter.setStretchFactor(1, 2)
+
+        main_splitter.addWidget(top_widget)
+        main_splitter.addWidget(bottom_splitter)
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 2)
+
+        root_layout.addWidget(main_splitter)
+        self.setLayout(root_layout)
 
     def on_entity_changed(self):
         is_custom_entities = self.entity_selector.currentText() == "CustomEntities"
@@ -202,12 +241,32 @@ class PostTab(QWidget):
         if special_kind == "status":
             widget = QComboBox()
             widget.addItem("", None)
-            widget.addItem("V", "V")
-            widget.addItem("I", "I")
-            widget.addItem("D", "D")
-            widget.addItem("R", "R")
+            enum_values = prop.get("enum_values") or ["V", "I", "D", "R", "v", "i", "d", "r"]
+            seen = set()
+            for value in enum_values:
+                if value in seen:
+                    continue
+                seen.add(value)
+                widget.addItem(str(value), value)
             return {
                 "widget_type": "status",
+                "widget": widget,
+            }
+
+        if special_kind == "multilang_json":
+            widget = QTextEdit()
+            widget.setMaximumHeight(90)
+            widget.setPlaceholderText('Ejemplo: {"es":"Texto","en":"Text"}')
+            return {
+                "widget_type": "multilang_json",
+                "widget": widget,
+            }
+
+        if special_kind == "asset_ref":
+            widget = QLineEdit()
+            widget.setPlaceholderText("Nombre del fichero ya existente en el PIM")
+            return {
+                "widget_type": "asset_ref",
                 "widget": widget,
             }
 
@@ -259,6 +318,7 @@ class PostTab(QWidget):
                 "required": False,
                 "custom_type": "image",
                 "postable": True,
+                "special_kind": "asset_ref",
             },
             {
                 "name": "prod_stat",
@@ -268,6 +328,7 @@ class PostTab(QWidget):
                 "custom_type": "status",
                 "postable": True,
                 "special_kind": "status",
+                "enum_values": ["V", "I", "D", "R", "v", "i", "d", "r"],
             },
             {
                 "name": "cat_id",
@@ -323,7 +384,96 @@ class PostTab(QWidget):
         post_fields.sort(key=lambda x: (order_priority.get(x["name"], 999), x["name"]))
         return post_fields
 
+    def _get_category_post_fields(self, properties: list[dict]) -> list[dict]:
+        fields = []
+        names = set()
+
+        def add_field(prop):
+            if prop["name"] in names:
+                return
+            names.add(prop["name"])
+            fields.append(prop)
+
+        excluded = {
+            "cat_id",
+            "cat_parent_ref",
+            "cat_parent_path",
+            "cat_creation",
+            "cat_modify",
+        }
+
+        for prop in properties:
+            if not prop.get("postable", False):
+                continue
+            if prop["name"] in excluded:
+                continue
+
+            if prop["type"] in SIMPLE_TYPES:
+                if prop.get("custom_type") == "status":
+                    prop = {**prop, "special_kind": "status"}
+                add_field(prop)
+
+        for prop in properties:
+            if prop["name"] in excluded:
+                continue
+
+            if prop["name"] == "cat_ref":
+                add_field({**prop, "required": True})
+                continue
+
+            if prop.get("x_cultures"):
+                add_field({**prop, "special_kind": "multilang_json"})
+                continue
+
+            if prop.get("custom_type") in ASSET_CUSTOM_TYPES:
+                add_field({
+                    **prop,
+                    "type": "string | null",
+                    "special_kind": "asset_ref",
+                })
+
+        if "cat_parent_id" not in names:
+            add_field({
+                "name": "cat_parent_id",
+                "title": "Parent Category ID",
+                "type": "integer | null",
+                "required": False,
+                "custom_type": "",
+                "postable": True,
+            })
+
+        order_priority = {
+            "cat_ref": 1,
+            "cat_title": 2,
+            "cat_description": 3,
+            "cat_image": 4,
+            "cat_stat": 5,
+            "cat_parent_id": 6,
+            "cat_tags": 7,
+        }
+
+        fields.sort(key=lambda x: (order_priority.get(x["name"], 999), x["name"]))
+        return fields
+
     def _get_variant_post_fields(self, properties: list[dict]) -> list[dict]:
+        fields = []
+        names = set()
+
+        def add_field(prop):
+            if prop["name"] in names:
+                return
+            names.add(prop["name"])
+            fields.append(prop)
+
+        add_field({
+            "name": "prod_id",
+            "title": "Product ID / Reference",
+            "type": "string | null",
+            "required": True,
+            "custom_type": "",
+            "postable": True,
+        })
+
         excluded = {
             "prod_ref",
             "frmt_id",
@@ -332,30 +482,42 @@ class PostTab(QWidget):
             "frmt_stat",
         }
 
-        post_fields = [
-            prop for prop in properties
-            if prop.get("postable", False)
-            and prop["type"] in SIMPLE_TYPES
-            and prop["name"] not in excluded
-        ]
+        for prop in properties:
+            if prop["name"] in excluded:
+                continue
 
-        existing_names = {prop["name"] for prop in post_fields}
+            if prop.get("postable", False) and prop["type"] in SIMPLE_TYPES:
+                add_field(prop)
 
-        if "prod_id" not in existing_names:
-            post_fields.insert(0, {
-                "name": "prod_id",
-                "title": "Product ID / Reference",
-                "type": "string | null",
-                "required": True,
-                "custom_type": "",
-                "postable": True,
-            })
+        for prop in properties:
+            if prop["name"] in excluded:
+                continue
 
-        return post_fields
+            if prop.get("x_cultures"):
+                add_field({**prop, "special_kind": "multilang_json"})
+                continue
+
+            if prop.get("custom_type") in ASSET_CUSTOM_TYPES:
+                add_field({
+                    **prop,
+                    "type": "string | null",
+                    "special_kind": "asset_ref",
+                })
+
+        order_priority = {
+            "prod_id": 1,
+            "frmt_ref": 2,
+        }
+
+        fields.sort(key=lambda x: (order_priority.get(x["name"], 999), x["name"]))
+        return fields
 
     def _get_post_fields_for_entity(self, entity: str, properties: list[dict]) -> list[dict]:
         if entity == "Products":
             return self._get_product_post_fields(properties)
+
+        if entity == "Categories":
+            return self._get_category_post_fields(properties)
 
         if entity == "Variants":
             return self._get_variant_post_fields(properties)
@@ -372,6 +534,14 @@ class PostTab(QWidget):
             label_text = f'{prop["name"]} | {prop["title"]} | {prop["type"]}'
             if prop.get("required"):
                 label_text += " | required"
+
+            special_kind = prop.get("special_kind")
+            if special_kind == "multilang_json":
+                label_text += " | multi-language JSON"
+            elif special_kind == "asset_ref":
+                label_text += " | existing file/image"
+            elif special_kind == "status":
+                label_text += " | status"
 
             widget_info = self._create_input_widget_for_property(prop)
             self.form_layout.addRow(QLabel(label_text), widget_info["widget"])
@@ -423,10 +593,16 @@ class PostTab(QWidget):
             ]
 
             if entity == "Products":
-                info_lines.append("Overlay activo para Products: prod_title, prod_description, prod_image, prod_stat, cat_id y typ_id.")
-                info_lines.append("Los campos traducibles se enviarán como string simple usando el idioma del selector.")
-                info_lines.append("prod_image debe apuntar a un archivo ya existente en el PIM.")
-            if entity == "CustomEntities":
+                info_lines.append("Products usa overlay específico con strings simples y Accept-Language.")
+                info_lines.append("prod_image debe apuntar a un fichero ya existente en el PIM.")
+            elif entity == "Categories":
+                info_lines.append("Categories admite multiidioma JSON y campos de imagen/archivo.")
+                info_lines.append('Ejemplo multiidioma: {"es":"Título","en":"Title"}')
+                info_lines.append("cat_image debe apuntar a un fichero ya existente en el PIM.")
+            elif entity == "Variants":
+                info_lines.append("Variants fuerza prod_id y admite campos de imagen/archivo y multiidioma detectados por metadata.")
+                info_lines.append('Para campos multiidioma usa JSON como {"es":"Texto","en":"Text"}')
+            elif entity == "CustomEntities":
                 info_lines.append(f"Tabla seleccionada: {self.get_selected_custom_entity_denominator()}")
 
             self.form_info.setPlainText("\n".join(info_lines))
@@ -450,10 +626,35 @@ class PostTab(QWidget):
         if widget_type in {"boolean", "status"}:
             return widget_info["widget"].currentData()
 
-        raw = widget_info["widget"].text().strip()
+        raw = widget_info["widget"].toPlainText().strip() if widget_type == "multilang_json" else widget_info["widget"].text().strip()
 
         if raw == "":
             return None
+
+        if widget_type == "multilang_json":
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"El campo {prop['name']} debe contener un JSON válido. "
+                    'Ejemplo: {"es":"Texto","en":"Text"}'
+                ) from e
+
+            if not isinstance(value, dict):
+                raise ValueError(f"El campo {prop['name']} debe ser un objeto JSON por idioma.")
+
+            cleaned = {}
+            for lang, text in value.items():
+                if text is None:
+                    continue
+                text_str = str(text).strip()
+                if text_str != "":
+                    cleaned[str(lang).strip()] = text_str
+
+            if not cleaned:
+                return None
+
+            return cleaned
 
         if field_type in {"integer", "integer | null"}:
             try:

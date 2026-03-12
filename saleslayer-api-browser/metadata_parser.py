@@ -21,6 +21,9 @@ SIMPLE_TYPES = {
 }
 
 
+ASSET_CUSTOM_TYPES = {"image_pack", "file"}
+
+
 def _normalize_type(type_value):
     if isinstance(type_value, list):
         return " | ".join(str(t) for t in type_value)
@@ -106,30 +109,43 @@ def _select_schema(
 
 
 def _is_postable_property(field_name: str, field_schema: dict, field_type: str, schema: dict) -> bool:
-    if field_type not in SIMPLE_TYPES:
-        return False
-
     custom_type = field_schema.get("x-custom-type", "")
-    if custom_type == "status":
-        return False
+    entity_title = schema.get("title", "")
 
     identifier_attr = schema.get("x-storage-object-identifier-attribute")
     status_attr = schema.get("x-storage-object-status-attribute")
 
     if field_name == identifier_attr:
         return False
-    if field_name == status_attr:
+
+    if entity_title == "Variant" and field_name == "prod_id":
+        return True
+
+    if entity_title == "Variant" and field_name == "prod_ref":
         return False
 
-    lowered = field_name.lower()
-    if lowered.endswith("_id"):
-        return False
-    if lowered.endswith("_creation"):
-        return False
-    if lowered.endswith("_modify"):
-        return False
+    if custom_type in ASSET_CUSTOM_TYPES:
+        return True
 
-    return True
+    if field_type in SIMPLE_TYPES:
+        if custom_type == "status" and entity_title == "Variant":
+            return False
+
+        lowered = field_name.lower()
+
+        if field_name == status_attr and entity_title != "Product":
+            return False
+
+        if lowered.endswith("_creation"):
+            return False
+        if lowered.endswith("_modify"):
+            return False
+        if lowered.endswith("_id"):
+            return False
+
+        return True
+
+    return False
 
 
 def extract_properties_from_metadata(
@@ -156,6 +172,8 @@ def extract_properties_from_metadata(
         custom_type = field_schema.get("x-custom-type", "")
         is_required = field_name in required_fields
         is_postable = _is_postable_property(field_name, field_schema, field_type, selected_schema)
+        x_cultures = str(field_schema.get("x-cultures", "")).lower() == "true"
+        enum_values = field_schema.get("enum", [])
 
         result.append({
             "entity": selected_schema.get("title", ""),
@@ -165,6 +183,8 @@ def extract_properties_from_metadata(
             "custom_type": custom_type,
             "required": is_required,
             "postable": is_postable,
+            "x_cultures": x_cultures,
+            "enum_values": enum_values,
         })
 
     return result

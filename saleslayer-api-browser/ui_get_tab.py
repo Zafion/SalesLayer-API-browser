@@ -4,7 +4,8 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QListWidget, QListWidgetItem,
-    QTextEdit, QMessageBox, QSpinBox, QFileDialog, QSizePolicy
+    QTextEdit, QMessageBox, QSpinBox, QFileDialog, QSizePolicy,
+    QSplitter
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
@@ -64,7 +65,14 @@ class GetTab(QWidget):
         self.on_entity_changed()
 
     def build_ui(self):
-        main_layout = QVBoxLayout()
+        root_layout = QVBoxLayout()
+
+        main_splitter = QSplitter(Qt.Vertical)
+
+        # TOP AREA
+        top_widget = QWidget()
+        top_layout = QVBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
 
         controls_layout = QHBoxLayout()
 
@@ -97,13 +105,14 @@ class GetTab(QWidget):
         self.run_query_button.clicked.connect(self.run_query)
         controls_layout.addWidget(self.run_query_button)
 
-        main_layout.addLayout(controls_layout)
+        top_layout.addLayout(controls_layout)
 
-        main_layout.addWidget(QLabel("Campos disponibles:"))
+        top_layout.addWidget(QLabel("Campos disponibles:"))
         self.fields_list = QListWidget()
-        main_layout.addWidget(self.fields_list)
+        self.fields_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        top_layout.addWidget(self.fields_list, 1)
 
-        main_layout.addWidget(QLabel("Filtros:"))
+        top_layout.addWidget(QLabel("Filtros:"))
 
         filter_controls = QHBoxLayout()
 
@@ -136,17 +145,20 @@ class GetTab(QWidget):
         self.remove_filter_button.clicked.connect(self.remove_selected_filter)
         filter_controls.addWidget(self.remove_filter_button)
 
-        main_layout.addLayout(filter_controls)
+        top_layout.addLayout(filter_controls)
 
         self.filters_list = QListWidget()
         self.filters_list.setMaximumHeight(130)
-        main_layout.addWidget(self.filters_list)
+        top_layout.addWidget(self.filters_list)
 
-        main_layout.addWidget(QLabel("Query params:"))
-        self.query_preview = QTextEdit()
-        self.query_preview.setReadOnly(True)
-        self.query_preview.setMaximumHeight(120)
-        main_layout.addWidget(self.query_preview)
+        top_widget.setLayout(top_layout)
+
+        # BOTTOM AREA
+        bottom_splitter = QSplitter(Qt.Horizontal)
+
+        results_widget = QWidget()
+        results_layout = QVBoxLayout()
+        results_layout.setContentsMargins(0, 0, 0, 0)
 
         results_header = QHBoxLayout()
         results_header.addWidget(QLabel("Resultados JSON:"))
@@ -160,13 +172,37 @@ class GetTab(QWidget):
         results_header.addWidget(self.export_json_button)
 
         results_header.addStretch()
-        main_layout.addLayout(results_header)
+        results_layout.addLayout(results_header)
 
         self.results_output = QTextEdit()
         self.results_output.setReadOnly(True)
-        main_layout.addWidget(self.results_output)
+        results_layout.addWidget(self.results_output)
 
-        self.setLayout(main_layout)
+        results_widget.setLayout(results_layout)
+
+        params_widget = QWidget()
+        params_layout = QVBoxLayout()
+        params_layout.setContentsMargins(0, 0, 0, 0)
+
+        params_layout.addWidget(QLabel("Query params:"))
+        self.query_preview = QTextEdit()
+        self.query_preview.setReadOnly(True)
+        params_layout.addWidget(self.query_preview)
+
+        params_widget.setLayout(params_layout)
+
+        bottom_splitter.addWidget(results_widget)
+        bottom_splitter.addWidget(params_widget)
+        bottom_splitter.setStretchFactor(0, 3)
+        bottom_splitter.setStretchFactor(1, 2)
+
+        main_splitter.addWidget(top_widget)
+        main_splitter.addWidget(bottom_splitter)
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 2)
+
+        root_layout.addWidget(main_splitter)
+        self.setLayout(root_layout)
 
     def on_entity_changed(self):
         is_custom_entities = self.entity_selector.currentText() == "CustomEntities"
